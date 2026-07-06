@@ -1,0 +1,10 @@
+{
+  "name": "jira-multi",
+  "version": "1.0.0",
+  "description": "Multi-site Jira/Confluence for Claude Code — one token-based MCP server for all your Atlassian sites, folder→account auto-resolution, zero OAuth re-authentication.",
+  "author": { "name": "Habib Talib", "url": "https://github.com/habibtalib" },
+  "homepage": "https://github.com/habibtalib/claude-jira-multi",
+  "repository": "https://github.com/habibtalib/claude-jira-multi",
+  "license": "MIT",
+  "keywords": ["jira", "confluence", "atlassian", "mcp", "multi-account", "api-token"]
+}

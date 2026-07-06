@@ -1,0 +1,11 @@
+{
+  "name": "claude-jira-multi",
+  "owner": { "name": "Habib Talib", "url": "https://github.com/habibtalib" },
+  "plugins": [
+    {
+      "name": "jira-multi",
+      "source": "./",
+      "description": "Multi-site Jira/Confluence: one token-based MCP server for all your Atlassian sites, folder→account auto-resolution, zero OAuth re-authentication. Includes setup/init/adhoc/sync skills."
+    }
+  ]
+}
