@@ -94,8 +94,42 @@ Every tool takes an optional `account` to target any configured site.
 
 - **jira-setup** — configure accounts, store tokens safely, troubleshoot 401s
 - **jira-init** — link a repo: create the Jira project if missing + write the mapping
-- **jira-adhoc** — file bugs/issues from any folder; work an existing issue end-to-end
+- **jira-adhoc** — file bugs/issues from any folder; work an existing issue end-to-end; cross-site standup
+- **jira-plan** — turn meeting notes/specs into scoped Jira tickets with acceptance criteria
+- **jira-release** — draft release notes from a git range, cross-linked to the Jira issues in it
 - **jira-sync** — push a `.planning/ROADMAP.md` (GSD convention) to Jira tasks + a Confluence status page
+
+## Prompt recipes
+
+In the style of the [Claude Code prompt library](https://code.claude.com/docs/en/prompt-library)
+— copy, fill the slot, go:
+
+```text
+read PROJ-123, implement the fix, and run the tests
+```
+
+```text
+file a bug for this stack trace with repro steps: <paste the actual trace>
+```
+
+```text
+read meeting-notes.md and create a Jira ticket for each action item with acceptance criteria
+```
+
+```text
+which files would I need to touch to <change>? file a ticket with the estimate
+```
+
+```text
+draft release notes for v1.2.0..HEAD grouped by feature, fix, and breaking change, and link the Jira issues
+```
+
+```text
+what's on my plate across all my Jira sites? group by site, priority first
+```
+
+That last one is the point of this plugin — a cross-account sweep no
+single-site integration can do.
 
 ## Scripts
 

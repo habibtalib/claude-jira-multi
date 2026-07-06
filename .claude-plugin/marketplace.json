@@ -5,7 +5,7 @@
     {
       "name": "jira-multi",
       "source": "./",
-      "description": "Multi-site Jira/Confluence: one token-based MCP server for all your Atlassian sites, folder→account auto-resolution, zero OAuth re-authentication. Includes setup/init/adhoc/sync skills."
+      "description": "Multi-site Jira/Confluence: one token-based MCP server for all your Atlassian sites, folder→account auto-resolution, zero OAuth re-authentication. Includes setup/init/adhoc/plan/release/sync skills."
     }
   ]
 }
