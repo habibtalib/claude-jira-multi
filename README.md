@@ -136,7 +136,10 @@ single-site integration can do.
 
 Optional companion integration on the **official**
 [`lark-openapi-mcp`](https://github.com/larksuite/lark-openapi-mcp) server —
-this plugin adds the config, registration, and workflow skills:
+this plugin adds the config, registration, and workflow skills.
+**Full walkthrough: [docs/lark-tutorial.md](docs/lark-tutorial.md)** (app
+creation → scopes → version publish → register → verify, with the real errors
+you'll hit and their fixes).
 
 ```bash
 cp config.example/lark.env.example ~/.config/jira-multi/lark.env
