@@ -84,6 +84,7 @@ current folder resolves to) and `jira_myself`.
 | `jira_create_issue` | Create; project defaults from folder mapping; graceful issue-type fallback |
 | `jira_update_issue` | Update raw fields |
 | `jira_transition` | List or execute workflow transitions |
+| `jira_assign` | Assign: `me`, `reporter` (hand-back), accountId, or email/name |
 | `jira_comment` | Add a comment |
 | `jira_myself` | Credential check |
 | `jira_api` | Raw REST escape hatch — Jira `/rest/...` and Confluence `/wiki/...` |
@@ -95,6 +96,7 @@ Every tool takes an optional `account` to target any configured site.
 - **jira-setup** — configure accounts, store tokens safely, troubleshoot 401s
 - **jira-init** — link a repo: create the Jira project if missing + write the mapping
 - **jira-adhoc** — file bugs/issues from any folder; work an existing issue end-to-end; cross-site standup
+- **jira-work** — work-queue loop: brief of assigned + backlog tickets → start one → implement → auto-move to review with a comment and hand back to the reporter
 - **jira-plan** — turn meeting notes/specs into scoped Jira tickets with acceptance criteria
 - **jira-release** — draft release notes from a git range, cross-linked to the Jira issues in it
 - **jira-sync** — push a `.planning/ROADMAP.md` (GSD convention) to Jira tasks + a Confluence status page
@@ -107,6 +109,11 @@ In the style of the [Claude Code prompt library](https://code.claude.com/docs/en
 
 ```text
 read PROJ-123, implement the fix, and run the tests
+```
+
+```text
+what's assigned to me and what's in the backlog? brief me, then start the top one
+and when it's done move it to review and assign it back to the reporter
 ```
 
 ```text

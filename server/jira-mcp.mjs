@@ -221,6 +221,19 @@ const TOOLS = [
     },
   },
   {
+    name: 'jira_assign',
+    description: "Assign an issue. `assignee` accepts 'me', 'reporter' (hand back to whoever filed it), an accountId, or an email/name to search for.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        key: { type: 'string' },
+        assignee: { type: 'string', description: "'me' | 'reporter' | accountId | email or display name" },
+        account: { type: 'string' },
+      },
+      required: ['key', 'assignee'],
+    },
+  },
+  {
     name: 'jira_myself',
     description: 'Verify credentials: GET /myself on the resolved (or named) account.',
     inputSchema: { type: 'object', properties: { account: { type: 'string' } } },
@@ -282,6 +295,8 @@ async function callTool(name, args = {}) {
       return {
         ...meta, ...slimIssue(i),
         reporter: i.fields?.reporter?.displayName || null,
+        reporter_id: i.fields?.reporter?.accountId || null,
+        assignee_id: i.fields?.assignee?.accountId || null,
         created: i.fields?.created,
         labels: i.fields?.labels,
         description: i.fields?.description,
@@ -331,6 +346,28 @@ async function callTool(name, args = {}) {
       if (!t) throw new Error(`no transition '${args.to}' on ${args.key}; available: ${transitions.map((x) => x.name).join(', ')}`);
       await rest(acct, 'POST', `/rest/api/3/issue/${encodeURIComponent(args.key)}/transitions`, { transition: { id: t.id } });
       return { ...meta, key: args.key, transitioned_to: t.to || t.name };
+    }
+    case 'jira_assign': {
+      const who = String(args.assignee).trim();
+      let accountId, label;
+      if (who.toLowerCase() === 'me') {
+        const me = await rest(acct, 'GET', '/rest/api/3/myself');
+        accountId = me.accountId; label = me.displayName;
+      } else if (who.toLowerCase() === 'reporter' || who.toLowerCase() === 'creator') {
+        const i = await rest(acct, 'GET', `/rest/api/3/issue/${encodeURIComponent(args.key)}?fields=reporter,creator`);
+        const r = i.fields?.reporter || i.fields?.creator;
+        if (!r?.accountId) throw new Error(`issue ${args.key} has no reporter/creator to assign back to`);
+        accountId = r.accountId; label = r.displayName;
+      } else if (!who.includes('@') && /^[0-9a-f][0-9a-f:_-]{9,}$/i.test(who)) {
+        accountId = who; label = who;
+      } else {
+        const users = await rest(acct, 'GET', `/rest/api/3/user/search?query=${encodeURIComponent(who)}`);
+        const u = users.find((x) => x.emailAddress === who) || users[0];
+        if (!u) throw new Error(`no user found for '${who}' on ${acct.site}.atlassian.net`);
+        accountId = u.accountId; label = u.displayName;
+      }
+      await rest(acct, 'PUT', `/rest/api/3/issue/${encodeURIComponent(args.key)}/assignee`, { accountId });
+      return { ...meta, key: args.key, assigned_to: label, accountId };
     }
     case 'jira_comment': {
       const out = await rest(acct, 'POST', `/rest/api/3/issue/${encodeURIComponent(args.key)}/comment`, { body: adf(args.body) });
