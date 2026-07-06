@@ -98,6 +98,7 @@ Every tool takes an optional `account` to target any configured site.
 - **jira-plan** — turn meeting notes/specs into scoped Jira tickets with acceptance criteria
 - **jira-release** — draft release notes from a git range, cross-linked to the Jira issues in it
 - **jira-sync** — push a `.planning/ROADMAP.md` (GSD convention) to Jira tasks + a Confluence status page
+- **lark-setup / lark-tasks / lark-docs** — Lark Suite/Feishu task management and documentation (see below)
 
 ## Prompt recipes
 
@@ -131,6 +132,29 @@ what's on my plate across all my Jira sites? group by site, priority first
 That last one is the point of this plugin — a cross-account sweep no
 single-site integration can do.
 
+## Lark Suite / Feishu (tasks + docs)
+
+Optional companion integration on the **official**
+[`lark-openapi-mcp`](https://github.com/larksuite/lark-openapi-mcp) server —
+this plugin adds the config, registration, and workflow skills:
+
+```bash
+cp config.example/lark.env.example ~/.config/jira-multi/lark.env
+# fill in App ID/Secret from open.larksuite.com (or open.feishu.cn) + domain
+scripts/lark-add.sh     # registers MCP server 'lark' with task+doc presets
+```
+
+- **lark-setup** — app creation, permissions (`task:task`, `docx:document`,
+  `wiki:wiki`, `drive:drive`), tenant vs user token mode, troubleshooting
+- **lark-tasks** — create/assign/remind/complete Lark tasks; mirror a Jira
+  issue into Lark (`[KEY] summary`, one-way, Jira stays source of truth)
+- **lark-docs** — search/read docs & wiki; publish markdown as Lark docs
+  (release notes, status reports); share with view-only default
+
+Upstream beta caveats: docs are import/read (no in-place editing), no file
+upload/download. For living status pages use Confluence via jira-sync; use
+Lark docs for point-in-time publishes.
+
 ## Scripts
 
 | Script | Purpose |
@@ -139,6 +163,7 @@ single-site integration can do.
 | `scripts/jira-init.sh <repo> [acct[:KEY[:SPACE]]]` | Ensure Jira project exists + write folder mapping |
 | `scripts/jira.sh <account> <METHOD> <path> [json]` | Raw curl wrapper for shells/cron |
 | `scripts/roadmap-sync.mjs <repo> [--dry]` | Roadmap phases → Jira tasks (idempotent) + Confluence page |
+| `scripts/lark-add.sh` | Register the official Lark MCP server from `lark.env` |
 
 ## Gotchas (learned the hard way)
 
