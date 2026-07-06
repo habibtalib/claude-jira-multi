@@ -8,6 +8,12 @@ description: Use when a repo/folder needs Jira linkage — new project kickoff, 
 Ensures a Jira project exists for the repo and writes the folder→account
 mapping that jira-multi's auto-resolution relies on.
 
+**No accounts configured yet?** (script says "no Atlassian accounts
+configured", or `jira_accounts` shows none) — run the **jira-setup** skill
+first: it creates `accounts.env` and walks the user through token creation.
+The token paste is always a user step (Atlassian gates the token page behind
+an emailed passcode); Claude prepares everything else.
+
 ```bash
 <plugin>/scripts/jira-init.sh <repo-dir> [account[:PROJECTKEY[:SPACEKEY]]] [--dry]
 ```

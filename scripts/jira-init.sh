@@ -21,12 +21,24 @@ spec="${2:-}"
 DRY=0; case "${2:-} ${3:-}" in *--dry*) DRY=1;; esac
 case "$spec" in --dry) spec="";; esac
 
+# first-run guard: no accounts configured at all → route to setup
+n_accounts=$(grep -cE '^[A-Z0-9_]+_SITE=' "$ENVF" 2>/dev/null || true)
+if [ "${n_accounts:-0}" -eq 0 ]; then
+  echo "no Atlassian accounts configured yet ($ENVF)."
+  echo "First-time setup:"
+  echo "  1. mkdir -p $CONF_DIR && cp <plugin>/config.example/accounts.env.example $ENVF"
+  echo "  2. edit $ENVF: set <NAME>_SITE and <NAME>_EMAIL for each Atlassian login"
+  echo "  3. $(dirname "$0")/jira-token-add.sh <name>   # paste API token (create at"
+  echo "     https://id.atlassian.com/manage-profile/security/api-tokens while logged in as that email)"
+  echo "Then re-run jira-init. (In Claude Code: run the jira-setup skill.)"
+  exit 1
+fi
+
 # default account: map.env default=, else the single configured account
 if [ -z "$spec" ]; then
   spec="$(grep '^default=' "$MAPF" | head -1 | cut -d= -f2- | cut -d: -f1 || true)"
   if [ -z "$spec" ]; then
-    accounts=$(grep -cE '^[A-Z0-9_]+_SITE=' "$ENVF" 2>/dev/null || echo 0)
-    if [ "$accounts" = 1 ]; then
+    if [ "$n_accounts" = 1 ]; then
       spec="$(grep -E '^[A-Z0-9_]+_SITE=' "$ENVF" | sed 's/_SITE=.*//' | tr '[:upper:]' '[:lower:]')"
     else
       echo "multiple accounts configured — pass one: jira-init.sh <repo> <account>[:KEY[:SPACE]]"
@@ -56,6 +68,14 @@ echo "$repo → account=$account project=$key${space:+ space=$space}"
 if [ "$DRY" = 1 ]; then
   echo "[dry] would ensure Jira project $key exists on '$account' and append '$repo=$account:$key${space:+:$space}' to $MAPF"
   exit 0
+fi
+
+# token present for this account?
+ACCT="$(echo "$account" | tr '[:lower:]' '[:upper:]')"
+if ! grep -qE "^${ACCT}_TOKEN=..+" "$ENVF"; then
+  echo "account '$account' has no API token yet — run: $(dirname "$0")/jira-token-add.sh $account"
+  echo "(create the token at https://id.atlassian.com/manage-profile/security/api-tokens while logged in as that account's email)"
+  exit 1
 fi
 
 # ensure project exists (create company-managed kanban if missing)
