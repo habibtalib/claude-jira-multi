@@ -266,6 +266,20 @@ const TOOLS = [
     },
   },
   {
+    name: 'jira_my_queue',
+    description: "Aggregate the caller's To-Do queue (assignee = currentUser() AND statusCategory = \"To Do\") across one or all configured accounts in a single call. Per-account failures are returned in errors[] instead of aborting the sweep. Read-only.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account: { type: 'string', description: "One account name, or 'all'/omitted = every configured account." },
+        project: { type: 'string', description: 'Restrict to a single project key.' },
+        max: { type: 'number', description: 'Max issues per account (default 10).' },
+        types: { type: 'array', items: { type: 'string' }, description: 'Issue types to include (default ["Task","Bug"]).' },
+        exclude_labels: { type: 'array', items: { type: 'string' }, description: 'Labels that disqualify an issue (default: the auto-* markers + blocked,needs-info,question,no-auto). Null-safe: issues with no labels are always included.' },
+      },
+    },
+  },
+  {
     name: 'jira_issue',
     description: 'Get one issue (summary, description, status, recent comments) by key. Description and comment bodies are rendered to readable markdown by default (pass raw:true for raw ADF JSON).',
     inputSchema: {
@@ -339,20 +353,22 @@ const TOOLS = [
       type: 'object',
       properties: {
         key: { type: 'string' },
-        fields: { type: 'object', description: 'Jira fields object for PUT /issue' },
+        fields: { type: 'object', description: 'Jira fields object for PUT /issue (SET semantics — replaces field values).' },
+        update: { type: 'object', description: 'Jira `update` verb object for non-destructive edits, e.g. {"labels":[{"add":"auto-inprogress"}]} adds a label without clobbering existing ones. Combine with or use instead of `fields`.' },
         account: { type: 'string' },
       },
-      required: ['key', 'fields'],
+      required: ['key'],
     },
   },
   {
     name: 'jira_transition',
-    description: 'List available transitions for an issue, or execute one by name/id when `to` is given.',
+    description: 'List available transitions for an issue (each with its target statusCategory), or execute one by name/id when `to` is given. Pass forbid_category to make the server refuse a transition whose target lands in that category.',
     inputSchema: {
       type: 'object',
       properties: {
         key: { type: 'string' },
         to: { type: 'string', description: 'Transition name or id to execute; omit to just list.' },
+        forbid_category: { type: 'string', description: "statusCategory key ('new'|'indeterminate'|'done') the server must REFUSE to transition into, e.g. 'done' to make Done unreachable. Applied only when executing." },
         account: { type: 'string' },
       },
       required: ['key'],
@@ -476,6 +492,49 @@ async function createWithFallback(acct, project, fields, wantType) {
   }
 }
 
+// Token-paginated JQL search collecting up to `max` raw issues. The enhanced
+// /search/jql endpoint returns no total and maxResults is only an upper bound,
+// so page via nextPageToken until isLast or `max` collected. Shared by
+// jira_search and jira_my_queue.
+async function searchJql(acct, jql, max, fields, cursor) {
+  const collected = [];
+  let token = cursor || undefined;
+  let isLast = false;
+  const PAGE_CAP = 25; // hard safety on internal loop iterations
+  for (let page = 0; collected.length < max && page < PAGE_CAP; page++) {
+    const req = { jql, maxResults: Math.min(max - collected.length, 100), fields };
+    if (token) req.nextPageToken = token;
+    const data = await rest(acct, 'POST', '/rest/api/3/search/jql', req);
+    collected.push(...(data.issues || []));
+    token = data.nextPageToken;
+    isLast = data.isLast ?? !token;
+    if (isLast || !token) break;
+  }
+  return { issues: collected, nextPageToken: token || null, isLast };
+}
+
+// Defaults for the "my To-Do queue" sweep. The label list keeps the autonomous
+// loop's own markers (and human skip markers) out of the pickup set; the
+// (labels IS EMPTY OR labels NOT IN (...)) form is mandatory — a bare NOT IN
+// would silently drop every unlabeled issue.
+const QUEUE_TYPES = ['Task', 'Bug'];
+const QUEUE_EXCLUDE_LABELS = [
+  'auto-inprogress', 'auto-needs-info', 'auto-attempted', 'auto-worked',
+  'blocked', 'needs-info', 'question', 'no-auto',
+];
+const QUEUE_FIELDS = ['summary', 'status', 'issuetype', 'priority', 'assignee', 'updated', 'created', 'labels', 'reporter'];
+
+function buildQueueJql({ project, types, excludeLabels } = {}) {
+  const parts = ['assignee = currentUser()', 'statusCategory = "To Do"'];
+  if (project) parts.push(`project = "${String(project).replace(/"/g, '')}"`);
+  const t = (types && types.length ? types : QUEUE_TYPES).map((x) => `"${String(x).replace(/"/g, '')}"`).join(', ');
+  parts.push(`issuetype IN (${t})`);
+  const ex = (excludeLabels && excludeLabels.length ? excludeLabels : QUEUE_EXCLUDE_LABELS)
+    .map((x) => `"${String(x).replace(/"/g, '')}"`).join(', ');
+  parts.push(`(labels IS EMPTY OR labels NOT IN (${ex}))`);
+  return parts.join(' AND ') + ' ORDER BY priority DESC, created ASC';
+}
+
 async function callTool(name, args = {}) {
   if (name === 'jira_accounts') {
     const accounts = loadAccounts();
@@ -491,6 +550,31 @@ async function callTool(name, args = {}) {
     };
   }
 
+  if (name === 'jira_my_queue') {
+    const accounts = loadAccounts();
+    const names = (args.account && String(args.account).toLowerCase() !== 'all')
+      ? [String(args.account).toLowerCase()]
+      : Object.keys(accounts);
+    const max = args.max || 10;
+    const jql = buildQueueJql({ project: args.project, types: args.types, excludeLabels: args.exclude_labels });
+    const queues = [];
+    const errors = [];
+    for (const nm of names) {
+      try {
+        const a = getAccount(nm);
+        const me = await rest(a, 'GET', '/rest/api/3/myself');
+        const { issues } = await searchJql(a, jql, max, QUEUE_FIELDS);
+        queues.push({
+          account: nm, site: `${a.site}.atlassian.net`, accountId: me.accountId,
+          count: issues.length, issues: issues.map((i) => slimIssue(i, QUEUE_FIELDS)),
+        });
+      } catch (e) {
+        errors.push({ account: nm, error: e.message });
+      }
+    }
+    return { jql, queues, errors };
+  }
+
   const acct = getAccount(args.account);
   const meta = { account: acct.name, site: `${acct.site}.atlassian.net`, resolved_via: acct.via };
 
@@ -502,29 +586,13 @@ async function callTool(name, args = {}) {
     case 'jira_search': {
       const max = args.max || 20;
       const fields = args.fields && args.fields.length ? args.fields : BASE_FIELDS;
-      // /rest/api/3/search/jql no longer returns a total, and maxResults is only
-      // an upper bound (a page may come back short while more matches exist), so
-      // page via nextPageToken until isLast or `max` collected. Never stop on
-      // "page shorter than requested".
-      const collected = [];
-      let token = args.cursor || args.nextPageToken || undefined;
-      let isLast = false;
-      const PAGE_CAP = 25; // hard safety on internal loop iterations
-      for (let page = 0; collected.length < max && page < PAGE_CAP; page++) {
-        const req = { jql: args.jql, maxResults: Math.min(max - collected.length, 100), fields };
-        if (token) req.nextPageToken = token;
-        const data = await rest(acct, 'POST', '/rest/api/3/search/jql', req);
-        collected.push(...(data.issues || []));
-        token = data.nextPageToken;
-        isLast = data.isLast ?? !token;
-        if (isLast || !token) break;
-      }
+      const { issues, nextPageToken, isLast } = await searchJql(acct, args.jql, max, fields, args.cursor || args.nextPageToken);
       const out = {
         ...meta,
-        returned: collected.length,
-        nextPageToken: token || null,
+        returned: issues.length,
+        nextPageToken,
         isLast,
-        issues: collected.map((i) => slimIssue(i, fields)),
+        issues: issues.map((i) => slimIssue(i, fields)),
       };
       if (args.count) {
         const c = await rest(acct, 'POST', '/rest/api/3/search/approximate-count', { jql: args.jql });
@@ -589,17 +657,28 @@ async function callTool(name, args = {}) {
       return { ...meta, created_count: created.length, error_count: errors.length, issues: created, errors };
     }
     case 'jira_update_issue': {
-      await rest(acct, 'PUT', `/rest/api/3/issue/${encodeURIComponent(args.key)}`, { fields: args.fields });
-      return { ...meta, key: args.key, updated: true };
+      if (args.fields == null && args.update == null) throw new Error('jira_update_issue needs `fields` and/or `update`');
+      const body = {};
+      if (args.fields != null) body.fields = args.fields;   // SET semantics
+      if (args.update != null) body.update = args.update;   // ADD/REMOVE/SET verbs (non-destructive)
+      await rest(acct, 'PUT', `/rest/api/3/issue/${encodeURIComponent(args.key)}`, body);
+      return { ...meta, key: args.key, updated: true, applied: Object.keys(body) };
     }
     case 'jira_transition': {
       const list = await rest(acct, 'GET', `/rest/api/3/issue/${encodeURIComponent(args.key)}/transitions`);
-      const transitions = (list.transitions || []).map((t) => ({ id: t.id, name: t.name, to: t.to?.name }));
+      const transitions = (list.transitions || []).map((t) => ({
+        id: t.id, name: t.name, to: t.to?.name, to_category: t.to?.statusCategory?.key || null,
+      }));
       if (!args.to) return { ...meta, key: args.key, transitions };
       const t = transitions.find((x) => x.id === String(args.to) || x.name.toLowerCase() === String(args.to).toLowerCase());
       if (!t) throw new Error(`no transition '${args.to}' on ${args.key}; available: ${transitions.map((x) => x.name).join(', ')}`);
+      // Server-side guard: refuse to land in a forbidden statusCategory (e.g. 'done').
+      // This holds even if a caller misuses the tool — the Done-guard is code, not prompt.
+      if (args.forbid_category && t.to_category === args.forbid_category) {
+        throw new Error(`refusing transition '${t.name}' on ${args.key}: target status '${t.to}' is in statusCategory '${t.to_category}', which is forbidden (forbid_category='${args.forbid_category}')`);
+      }
       await rest(acct, 'POST', `/rest/api/3/issue/${encodeURIComponent(args.key)}/transitions`, { transition: { id: t.id } });
-      return { ...meta, key: args.key, transitioned_to: t.to || t.name };
+      return { ...meta, key: args.key, transitioned_to: t.to || t.name, to_category: t.to_category };
     }
     case 'jira_assign': {
       const { accountId, label } = await resolveAssignee(acct, args.assignee, args.key);
@@ -642,7 +721,7 @@ rl.on('line', async (line) => {
       reply(id, {
         protocolVersion: params?.protocolVersion || '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'jira-multi', version: '1.1.0' },
+        serverInfo: { name: 'jira-multi', version: '1.2.0' },
       });
     } else if (method === 'notifications/initialized' || method === 'notifications/cancelled') {
       // no response to notifications

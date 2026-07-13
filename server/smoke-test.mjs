@@ -95,6 +95,11 @@ function looksLikeRawADF(v) {
       `props: ${Object.keys(createSchema).join(',')}`);
     const searchSchema = tools.find((t) => t.name === 'jira_search')?.inputSchema?.properties || {};
     ok('jira_search has fields+cursor+count', ['fields', 'cursor', 'count'].every((k) => k in searchSchema));
+    ok('tools/list has jira_my_queue (v1.2.0)', names.includes('jira_my_queue'));
+    const transSchema = tools.find((t) => t.name === 'jira_transition')?.inputSchema?.properties || {};
+    ok('jira_transition has forbid_category guard', 'forbid_category' in transSchema);
+    const updSchema = tools.find((t) => t.name === 'jira_update_issue')?.inputSchema?.properties || {};
+    ok('jira_update_issue accepts update verb', 'update' in updSchema);
 
     // ---- live read-only calls ----
     const me = await callTool('jira_myself', { account: ACCOUNT });
@@ -124,6 +129,31 @@ function looksLikeRawADF(v) {
         const rawDesc = rawIssue.parsed.description;
         ok('jira_issue raw:true returns ADF', rawDesc == null || looksLikeRawADF(rawDesc),
           rawDesc == null ? '(no description to compare)' : 'raw ADF preserved');
+      }
+    }
+
+    // ---- jira_my_queue (read-only sweep of To-Do queue) ----
+    const queue = await callTool('jira_my_queue', { account: ACCOUNT });
+    if (queue.isError) { ok('jira_my_queue (live)', false, queue.text.slice(0, 200)); }
+    else {
+      const q = queue.parsed;
+      const hasShape = Array.isArray(q.queues) && Array.isArray(q.errors) && typeof q.jql === 'string';
+      const acctQueue = (q.queues || []).find((x) => x.account === ACCOUNT);
+      ok('jira_my_queue returns queues[]+errors[]+jql', hasShape,
+        `queues=${q.queues?.length} ${acctQueue ? `${ACCOUNT}: ${acctQueue.count} To-Do, accountId ${acctQueue.accountId ? 'present' : 'MISSING'}` : ''}`);
+      ok('jira_my_queue JQL uses statusCategory + null-safe labels',
+        /statusCategory = "To Do"/.test(q.jql) && /labels IS EMPTY OR labels NOT IN/.test(q.jql), q.jql);
+    }
+
+    // ---- jira_transition list surfaces to_category (read-only) ----
+    if (firstKey) {
+      const trans = await callTool('jira_transition', { account: ACCOUNT, key: firstKey });
+      if (trans.isError) { ok('jira_transition to_category (live)', false, trans.text.slice(0, 200)); }
+      else {
+        const ts = trans.parsed.transitions || [];
+        const withCat = ts.filter((t) => 'to_category' in t);
+        ok('jira_transition exposes to_category', ts.length === 0 || withCat.length === ts.length,
+          `${firstKey}: ${ts.length} transitions, categories: ${[...new Set(ts.map((t) => t.to_category))].join(',') || '(none available)'}`);
       }
     }
   } catch (e) {
