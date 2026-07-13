@@ -17,6 +17,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { basename, dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 
 const CONFIG_DIR = process.env.JIRA_MULTI_CONFIG || join(homedir(), '.config', 'jira-multi');
 const ENV_FILE = process.env.ATLASSIAN_ENV || join(CONFIG_DIR, 'accounts.env');
@@ -244,6 +245,145 @@ function adfToMarkdown(doc) {
     }
   };
   return node(doc, '');
+}
+
+// ---------- markdown -> ADF (writer) ----------
+
+// Parse an inline markdown span into ADF text nodes. Handles `code`, [links](url),
+// **bold**/__bold__, *italic*/_italic_, and newlines (-> hardBreak). Marks compose
+// via recursion so bold-inside-link etc. carry multiple marks. Mirrors adfInline().
+function mdInline(text, marks) {
+  marks = marks || [];
+  const nodes = [];
+  const add = (mk, m) => mk.concat([m]);
+  const emit = (t, mk) => {
+    if (!t) return;
+    const parts = t.split('\n');
+    parts.forEach((p, k) => {
+      if (k > 0) nodes.push({ type: 'hardBreak' });
+      if (p !== '') nodes.push(mk.length ? { type: 'text', text: p, marks: mk } : { type: 'text', text: p });
+    });
+  };
+  const patterns = [
+    { type: 'code',   re: /`([^`\n]+)`/ },
+    { type: 'link',   re: /\[([^\]\n]+)\]\(([^)\s]+)\)/ },
+    { type: 'strong', re: /\*\*([\s\S]+?)\*\*/ },
+    { type: 'strong', re: /__([\s\S]+?)__/ },
+    { type: 'em',     re: /\*(?![\s*])([\s\S]+?)\*/ },
+    { type: 'em',     re: /(?<![A-Za-z0-9_])_(?!_)([^\n]+?)_(?![A-Za-z0-9_])/ },
+  ];
+  let idx = 0;
+  while (idx < text.length) {
+    let best = null;
+    const rest = text.slice(idx);
+    for (const p of patterns) {
+      const m = p.re.exec(rest);
+      if (m && (best == null || m.index < best.m.index)) best = { p, m };
+    }
+    if (!best) { emit(rest, marks); break; }
+    const start = idx + best.m.index;
+    if (start > idx) emit(text.slice(idx, start), marks);
+    const { p, m } = best;
+    if (p.type === 'code') {
+      nodes.push({ type: 'text', text: m[1], marks: add(marks, { type: 'code' }) });
+    } else if (p.type === 'link') {
+      nodes.push(...mdInline(m[1], add(marks, { type: 'link', attrs: { href: m[2] } })));
+    } else {
+      nodes.push(...mdInline(m[1], add(marks, { type: p.type })));
+    }
+    idx = start + best.m[0].length;
+  }
+  return nodes;
+}
+
+const LIST_RE = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
+
+// Parse an array of lines [start,end) into an array of ADF block nodes.
+function mdBlocks(lines, start, end) {
+  const blocks = [];
+  let i = start;
+  const isRule = (l) => /^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(l);
+  const isFence = (l) => /^(\s*)(`{3,}|~{3,})\s*([\w+#.-]*)\s*$/.exec(l);
+  const isHeading = (l) => /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/.exec(l);
+  const isBlockStart = (l) =>
+    /^\s*$/.test(l) || isRule(l) || !!isFence(l) || !!isHeading(l) || /^\s*>/.test(l) || LIST_RE.test(l);
+
+  // Parse a (possibly nested) list whose items sit at indentation `base`.
+  // Switching bullet<->ordered at the same indent starts a NEW list (breaks out).
+  const isOrdered = (marker) => /\d/.test(marker);
+  const parseList = (base) => {
+    const ordered = isOrdered(LIST_RE.exec(lines[i])[2]);
+    const listNode = { type: ordered ? 'orderedList' : 'bulletList', content: [] };
+    let last = null;
+    while (i < end) {
+      if (/^\s*$/.test(lines[i])) {
+        let j = i + 1; while (j < end && /^\s*$/.test(lines[j])) j++;
+        const mj = j < end ? LIST_RE.exec(lines[j]) : null;
+        // continue across the blank only for a deeper item, or a same-indent
+        // item of the SAME list type (bullet vs ordered)
+        if (mj && (mj[1].length > base || (mj[1].length === base && isOrdered(mj[2]) === ordered))) { i = j; continue; }
+        break;
+      }
+      const m = LIST_RE.exec(lines[i]);
+      if (!m) break;
+      const ind = m[1].length;
+      if (ind < base) break;
+      if (ind > base && last) { last.content.push(parseList(ind)); continue; }
+      if (ind === base && isOrdered(m[2]) !== ordered) break; // list type switch -> new list
+      const item = { type: 'listItem', content: [{ type: 'paragraph', content: mdInline(m[3]) }] };
+      listNode.content.push(item);
+      last = item;
+      i++;
+    }
+    return listNode;
+  };
+
+  while (i < end) {
+    const line = lines[i];
+    if (/^\s*$/.test(line)) { i++; continue; }
+    if (isRule(line)) { blocks.push({ type: 'rule' }); i++; continue; }
+    const h = isHeading(line);
+    if (h) { blocks.push({ type: 'heading', attrs: { level: h[1].length }, content: mdInline(h[2]) }); i++; continue; }
+    const f = isFence(line);
+    if (f) {
+      const marker = f[2][0]; const lang = f[3];
+      i++;
+      const code = [];
+      const close = new RegExp('^\\s*\\' + marker + '{3,}\\s*$');
+      while (i < end && !close.test(lines[i])) { code.push(lines[i]); i++; }
+      if (i < end) i++; // consume closing fence
+      const codeText = code.join('\n');
+      blocks.push({ type: 'codeBlock', attrs: lang ? { language: lang } : {}, content: codeText ? [{ type: 'text', text: codeText }] : [] });
+      continue;
+    }
+    if (/^\s*>/.test(line)) {
+      const q = [];
+      while (i < end && /^\s*>/.test(lines[i])) { q.push(lines[i].replace(/^\s*>\s?/, '')); i++; }
+      let inner = mdBlocks(q, 0, q.length);
+      if (inner.length === 0) inner = [{ type: 'paragraph' }];
+      blocks.push({ type: 'blockquote', content: inner });
+      continue;
+    }
+    if (LIST_RE.test(line)) { blocks.push(parseList(LIST_RE.exec(line)[1].length)); continue; }
+    // paragraph: gather consecutive lines until a blank line or another block start
+    const para = [];
+    para.push(lines[i]); i++;
+    while (i < end && !isBlockStart(lines[i])) { para.push(lines[i]); i++; }
+    blocks.push({ type: 'paragraph', content: mdInline(para.join('\n')) });
+  }
+  return blocks;
+}
+
+// Convert a markdown string into a valid ADF document (version 1). A practical
+// subset: headings, paragraphs, bullet/ordered lists (nested), fenced code,
+// blockquotes, horizontal rules, and inline bold/italic/code/links. Plain text
+// with no markdown yields a single paragraph (identical to the old flat adf()).
+function mdToAdf(markdown) {
+  const src = markdown == null ? '' : String(markdown);
+  const lines = src.replace(/\r\n?/g, '\n').split('\n');
+  const content = mdBlocks(lines, 0, lines.length);
+  if (content.length === 0) content.push({ type: 'paragraph' });
+  return { type: 'doc', version: 1, content };
 }
 
 // ---------- tools ----------
@@ -534,10 +674,9 @@ const TOOLS = [
   },
 ];
 
-const adf = (text) => ({
-  type: 'doc', version: 1,
-  content: [{ type: 'paragraph', content: [{ type: 'text', text }] }],
-});
+// Thin wrapper kept for existing call sites: markdown (or plain text) -> ADF doc.
+// Plain strings with no markdown produce a single paragraph, exactly as before.
+const adf = (text) => mdToAdf(text);
 
 // Resolve an assignee spec ('me' | 'reporter'/'creator' | accountId | email/name)
 // to { accountId, label }. Shared by jira_assign and create-issue field building.
@@ -570,7 +709,7 @@ async function buildCreateFields(acct, spec, defaultProject) {
     summary: spec.summary,
     issuetype: { name: spec.type || 'Task' },
   };
-  if (spec.description != null) fields.description = typeof spec.description === 'object' ? spec.description : adf(spec.description);
+  if (spec.description != null) fields.description = typeof spec.description === 'object' ? spec.description : mdToAdf(spec.description);
   if (spec.labels) fields.labels = spec.labels;
   if (spec.priority) fields.priority = { name: spec.priority };
   if (spec.parent) fields.parent = { key: spec.parent };
@@ -662,7 +801,7 @@ async function resolveSpaceId(acct, spaceKey) {
 }
 
 // Confluence v2 wants the ADF body as a JSON-encoded STRING, not an object.
-const confBody = (markdown) => ({ representation: 'atlas_doc_format', value: JSON.stringify(adf(markdown ?? '')) });
+const confBody = (markdown) => ({ representation: 'atlas_doc_format', value: JSON.stringify(mdToAdf(markdown ?? '')) });
 
 // Jira worklog `started` must be ...T..±HHMM (it rejects the trailing 'Z').
 function worklogStarted(started) {
@@ -845,6 +984,8 @@ async function callTool(name, args = {}) {
       if (args.fields == null && args.update == null) throw new Error('jira_update_issue needs `fields` and/or `update`');
       const body = {};
       if (args.fields != null) body.fields = args.fields;   // SET semantics
+      // Convenience: a string `description` is treated as markdown and converted to ADF.
+      if (body.fields && typeof body.fields.description === 'string') body.fields.description = mdToAdf(body.fields.description);
       if (args.update != null) body.update = args.update;   // ADD/REMOVE/SET verbs (non-destructive)
       await rest(acct, 'PUT', `/rest/api/3/issue/${encodeURIComponent(args.key)}`, body);
       return { ...meta, key: args.key, updated: true, applied: Object.keys(body) };
@@ -871,7 +1012,7 @@ async function callTool(name, args = {}) {
       return { ...meta, key: args.key, assigned_to: label, accountId };
     }
     case 'jira_comment': {
-      const out = await rest(acct, 'POST', `/rest/api/3/issue/${encodeURIComponent(args.key)}/comment`, { body: adf(args.body) });
+      const out = await rest(acct, 'POST', `/rest/api/3/issue/${encodeURIComponent(args.key)}/comment`, { body: mdToAdf(args.body) });
       return { ...meta, key: args.key, comment_id: out.id };
     }
     case 'jira_api': {
@@ -981,7 +1122,7 @@ async function callTool(name, args = {}) {
         return { ...meta, key: args.key, total: wl.total ?? worklogs.length, worklogs };
       }
       const body = { timeSpent: args.timeSpent, started: worklogStarted(args.started) };
-      if (args.comment) body.comment = adf(args.comment);
+      if (args.comment) body.comment = mdToAdf(args.comment);
       const out = await rest(acct, 'POST', `/rest/api/3/issue/${encodeURIComponent(args.key)}/worklog`, body);
       return { ...meta, key: args.key, worklog_id: out.id, timeSpent: out.timeSpent, started: out.started };
     }
@@ -1045,6 +1186,16 @@ let pending = 0;
 let stdinClosed = false;
 const maybeExit = () => { if (stdinClosed && pending === 0) process.exit(0); };
 
+// Only run the stdio JSON-RPC loop when executed directly (node jira-mcp.mjs),
+// not when imported (e.g. by offline unit tests for the pure md<->ADF helpers).
+const isMain = !!process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+// Exposed for offline unit tests (see smoke-test-md.mjs); no effect on the server.
+export { mdToAdf, mdInline, mdBlocks, adfToMarkdown, adfInline };
+
+if (!isMain) {
+  // imported as a module: skip stdio bootstrap
+} else {
 const rl = createInterface({ input: process.stdin, terminal: false });
 rl.on('line', async (line) => {
   line = line.trim();
@@ -1057,7 +1208,7 @@ rl.on('line', async (line) => {
       reply(id, {
         protocolVersion: params?.protocolVersion || '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'jira-multi', version: '1.3.0' },
+        serverInfo: { name: 'jira-multi', version: '1.4.0' },
       });
     } else if (method === 'notifications/initialized' || method === 'notifications/cancelled') {
       // no response to notifications
@@ -1084,3 +1235,4 @@ rl.on('line', async (line) => {
   }
 });
 rl.on('close', () => { stdinClosed = true; maybeExit(); });
+}

@@ -94,7 +94,7 @@ function looksLikeRawADF(v) {
     const init = await rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'smoke', version: '0' } });
     ok('initialize', !!init.result?.serverInfo, `server ${init.result?.serverInfo?.name} v${init.result?.serverInfo?.version}`);
 
-    ok('serverInfo is v1.3.0', init.result?.serverInfo?.version === '1.3.0', `v${init.result?.serverInfo?.version}`);
+    ok('serverInfo is v1.4.0', init.result?.serverInfo?.version === '1.4.0', `v${init.result?.serverInfo?.version}`);
 
     const list = await rpc('tools/list', {});
     const tools = list.result?.tools || [];
