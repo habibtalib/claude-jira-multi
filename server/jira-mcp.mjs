@@ -98,6 +98,14 @@ function getAccount(explicit) {
 
 // ---------- Atlassian REST ----------
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Retry on 429 (rate limit) and transient 5xx (502/503/504). Honors the
+// Retry-After header exactly when present (Atlassian penalizes early retries),
+// otherwise exponential backoff with full jitter, capped ~30s, max 4 attempts.
+const MAX_RETRIES = 4;
+const RETRYABLE = new Set([429, 502, 503, 504]);
+
 async function rest(acct, method, path, body) {
   const url = `https://${acct.site}.atlassian.net${path}`;
   const headers = {
@@ -109,29 +117,129 @@ async function rest(acct, method, path, body) {
     headers['Content-Type'] = 'application/json';
     opts.body = typeof body === 'string' ? body : JSON.stringify(body);
   }
-  const res = await fetch(url, opts);
-  const text = await res.text();
-  let data;
-  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text.slice(0, 2000) }; }
-  if (!res.ok) {
-    const msg = data?.errorMessages?.join('; ') || data?.message || text.slice(0, 500) || res.statusText;
-    // Atlassian quirk: 401 is returned both for bad credentials AND for valid
-    // credentials that simply lack access to this site.
-    const hint = res.status === 401 ? ' (401 can also mean this account has no access to this site — try another `account`)' : '';
-    throw new Error(`${method} ${url} → HTTP ${res.status}: ${msg}${hint}`);
+
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, opts);
+    if (RETRYABLE.has(res.status) && attempt < MAX_RETRIES) {
+      const retryAfter = Number(res.headers.get('retry-after'));
+      const wait = retryAfter > 0
+        ? retryAfter * 1000
+        : Math.random() * Math.min(2 ** attempt * 500, 30000);
+      if (process.env.JIRA_MCP_DEBUG) {
+        const reason = res.headers.get('ratelimit-reason') || '';
+        console.error(`[jira-mcp] ${res.status} on ${method} ${path} — retry ${attempt + 1}/${MAX_RETRIES} in ${Math.round(wait)}ms ${reason}`);
+      }
+      await sleep(wait);
+      continue;
+    }
+    const text = await res.text();
+    let data;
+    try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text.slice(0, 2000) }; }
+    if (!res.ok) {
+      const msg = data?.errorMessages?.join('; ') || data?.message || text.slice(0, 500) || res.statusText;
+      // Atlassian quirk: 401 is returned both for bad credentials AND for valid
+      // credentials that simply lack access to this site.
+      const hint = res.status === 401 ? ' (401 can also mean this account has no access to this site — try another `account`)' : '';
+      const reason = res.headers.get('ratelimit-reason');
+      const rlHint = RETRYABLE.has(res.status) && reason ? ` (rate-limited after ${MAX_RETRIES} retries; reason: ${reason})` : '';
+      throw new Error(`${method} ${url} → HTTP ${res.status}: ${msg}${hint}${rlHint}`);
+    }
+    return data;
   }
-  return data;
 }
 
-const slimIssue = (i) => ({
-  key: i.key,
-  summary: i.fields?.summary,
-  status: i.fields?.status?.name,
-  type: i.fields?.issuetype?.name,
-  priority: i.fields?.priority?.name,
-  assignee: i.fields?.assignee?.displayName || null,
-  updated: i.fields?.updated,
-});
+const BASE_FIELDS = ['summary', 'status', 'issuetype', 'priority', 'assignee', 'updated'];
+
+const slimIssue = (i, fields) => {
+  const out = {
+    key: i.key,
+    summary: i.fields?.summary,
+    status: i.fields?.status?.name,
+    type: i.fields?.issuetype?.name,
+    priority: i.fields?.priority?.name,
+    assignee: i.fields?.assignee?.displayName || null,
+    updated: i.fields?.updated,
+  };
+  // Pass through any extra requested fields (labels, duedate, parent, story points, etc.)
+  if (fields) for (const f of fields) {
+    if (!BASE_FIELDS.includes(f) && i.fields && f in i.fields) out[f] = i.fields[f];
+  }
+  return out;
+};
+
+// ---------- ADF <-> markdown ----------
+
+// Convert inline ADF nodes (text + marks) to markdown.
+function adfInline(nodes = []) {
+  return (nodes || []).map((n) => {
+    if (n.type === 'text') {
+      let t = n.text || '';
+      for (const m of n.marks || []) {
+        if (m.type === 'code') t = '`' + t + '`';
+        else if (m.type === 'strong') t = '**' + t + '**';
+        else if (m.type === 'em') t = '*' + t + '*';
+        else if (m.type === 'strike') t = '~~' + t + '~~';
+        else if (m.type === 'link') t = `[${t}](${m.attrs?.href || ''})`;
+      }
+      return t;
+    }
+    if (n.type === 'hardBreak') return '\n';
+    if (n.type === 'mention') return '@' + (n.attrs?.text || n.attrs?.displayName || n.attrs?.id || '');
+    if (n.type === 'emoji') return n.attrs?.text || n.attrs?.shortName || '';
+    if (n.type === 'inlineCard') return n.attrs?.url || n.attrs?.data?.url || '';
+    if (n.content) return adfInline(n.content);
+    return '';
+  }).join('');
+}
+
+// Convert an ADF document (or fragment) to readable markdown. Handles the block
+// types GSD/Jira actually emit; unknown nodes recurse into their content.
+function adfToMarkdown(doc) {
+  if (doc == null) return null;
+  if (typeof doc === 'string') return doc;
+  if (typeof doc !== 'object') return String(doc);
+  const block = (nodes, indent) => (nodes || []).map((n) => node(n, indent)).filter((s) => s !== '' && s != null).join('\n\n');
+  const node = (n, indent = '') => {
+    switch (n.type) {
+      case 'doc': return block(n.content, indent);
+      case 'paragraph': return indent + adfInline(n.content);
+      case 'heading': return indent + '#'.repeat(n.attrs?.level || 1) + ' ' + adfInline(n.content);
+      case 'rule': return indent + '---';
+      case 'hardBreak': return '';
+      case 'codeBlock': {
+        const lang = n.attrs?.language || '';
+        const code = (n.content || []).map((c) => c.text || '').join('');
+        return indent + '```' + lang + '\n' + code.split('\n').map((l) => indent + l).join('\n') + '\n' + indent + '```';
+      }
+      case 'blockquote':
+        return block(n.content, '').split('\n').map((l) => indent + '> ' + l).join('\n');
+      case 'panel': {
+        const tag = (n.attrs?.panelType || 'info').toUpperCase();
+        return block(n.content, '').split('\n').map((l, i) => indent + '> ' + (i === 0 ? `[${tag}] ` : '') + l).join('\n');
+      }
+      case 'bulletList':
+      case 'orderedList': {
+        const ordered = n.type === 'orderedList';
+        const out = [];
+        (n.content || []).forEach((li, idx) => {
+          const marker = ordered ? `${idx + 1}. ` : '- ';
+          const pad = ' '.repeat(marker.length);
+          block(li.content, '').split('\n').forEach((l, i) => out.push(indent + (i === 0 ? marker : pad) + l));
+        });
+        return out.join('\n');
+      }
+      case 'listItem': return block(n.content, indent);
+      case 'mediaSingle':
+      case 'mediaGroup': return indent + '[media]';
+      case 'table': return indent + '[table — use raw:true to inspect]';
+      default:
+        if (n.content) return block(n.content, indent);
+        if (n.text) return indent + n.text;
+        return '';
+    }
+  };
+  return node(doc, '');
+}
 
 // ---------- tools ----------
 
@@ -143,25 +251,29 @@ const TOOLS = [
   },
   {
     name: 'jira_search',
-    description: 'Search issues with JQL on the folder-resolved (or explicitly named) Jira site. Returns slim issue list.',
+    description: 'Search issues with JQL on the folder-resolved (or explicitly named) Jira site. Token-paginated (nextPageToken/isLast); auto-loops internally until `max` collected. NOTE: the enhanced-search endpoint no longer returns a total — pass count:true for an approximate count.',
     inputSchema: {
       type: 'object',
       properties: {
         jql: { type: 'string', description: "JQL, e.g. 'project = ABC AND status != Done ORDER BY updated DESC'" },
         account: { type: 'string', description: 'Account name from accounts.env. Omit to auto-resolve from folder.' },
-        max: { type: 'number', description: 'Max results (default 20)' },
+        max: { type: 'number', description: 'Max issues to collect across pages (default 20).' },
+        fields: { type: 'array', items: { type: 'string' }, description: 'Field ids/names to return (default: summary,status,issuetype,priority,assignee,updated). Add labels,duedate,parent,customfield_XXXXX etc.' },
+        cursor: { type: 'string', description: 'nextPageToken from a previous call, to fetch the following page.' },
+        count: { type: 'boolean', description: 'When true, also return approxCount via POST /search/approximate-count.' },
       },
       required: ['jql'],
     },
   },
   {
     name: 'jira_issue',
-    description: 'Get one issue (summary, description, status, recent comments) by key.',
+    description: 'Get one issue (summary, description, status, recent comments) by key. Description and comment bodies are rendered to readable markdown by default (pass raw:true for raw ADF JSON).',
     inputSchema: {
       type: 'object',
       properties: {
         key: { type: 'string', description: 'Issue key, e.g. ABC-123' },
         account: { type: 'string', description: 'Account name; omit to auto-resolve from folder.' },
+        raw: { type: 'boolean', description: 'Return raw ADF JSON for description/comments instead of markdown.' },
       },
       required: ['key'],
     },
@@ -175,10 +287,49 @@ const TOOLS = [
         summary: { type: 'string' },
         project: { type: 'string', description: 'Project key; omit to use folder-mapped project.' },
         type: { type: 'string', description: 'Issue type name (default Task)' },
-        description: { type: 'string', description: 'Plain-text description' },
+        description: { type: 'string', description: 'Plain-text description (wrapped in ADF).' },
+        labels: { type: 'array', items: { type: 'string' }, description: 'Labels to set.' },
+        priority: { type: 'string', description: 'Priority name, e.g. High.' },
+        assignee: { type: 'string', description: "'me' | email | display name | accountId (same resolution as jira_assign)." },
+        parent: { type: 'string', description: 'Parent issue key (for subtasks or epic children).' },
+        duedate: { type: 'string', description: 'Due date, YYYY-MM-DD.' },
+        components: { type: 'array', items: { type: 'string' }, description: 'Component names.' },
+        fields: { type: 'object', description: 'Extra raw Jira fields merged last (escape hatch for custom fields).' },
         account: { type: 'string' },
       },
       required: ['summary'],
+    },
+  },
+  {
+    name: 'jira_bulk_create',
+    description: 'Create many issues in one call (chunked at 50 per POST /issue/bulk). Each item accepts the same fields as jira_create_issue. Returns created issues[] and per-item errors[] — partial success is normal. Project defaults to the folder-mapped project.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        issues: {
+          type: 'array',
+          description: 'Array of issue specs: {summary, type?, description?, labels?, priority?, assignee?, parent?, duedate?, components?, project?, fields?}.',
+          items: {
+            type: 'object',
+            properties: {
+              summary: { type: 'string' },
+              type: { type: 'string' },
+              description: { type: 'string' },
+              labels: { type: 'array', items: { type: 'string' } },
+              priority: { type: 'string' },
+              assignee: { type: 'string' },
+              parent: { type: 'string' },
+              duedate: { type: 'string' },
+              components: { type: 'array', items: { type: 'string' } },
+              project: { type: 'string' },
+              fields: { type: 'object' },
+            },
+            required: ['summary'],
+          },
+        },
+        account: { type: 'string' },
+      },
+      required: ['issues'],
     },
   },
   {
@@ -259,6 +410,72 @@ const adf = (text) => ({
   content: [{ type: 'paragraph', content: [{ type: 'text', text }] }],
 });
 
+// Resolve an assignee spec ('me' | 'reporter'/'creator' | accountId | email/name)
+// to { accountId, label }. Shared by jira_assign and create-issue field building.
+async function resolveAssignee(acct, spec, issueKey) {
+  const who = String(spec).trim();
+  if (who.toLowerCase() === 'me') {
+    const me = await rest(acct, 'GET', '/rest/api/3/myself');
+    return { accountId: me.accountId, label: me.displayName };
+  }
+  if (who.toLowerCase() === 'reporter' || who.toLowerCase() === 'creator') {
+    if (!issueKey) throw new Error("assignee 'reporter'/'creator' needs an existing issue key");
+    const i = await rest(acct, 'GET', `/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=reporter,creator`);
+    const r = i.fields?.reporter || i.fields?.creator;
+    if (!r?.accountId) throw new Error(`issue ${issueKey} has no reporter/creator to assign back to`);
+    return { accountId: r.accountId, label: r.displayName };
+  }
+  if (!who.includes('@') && /^[0-9a-f][0-9a-f:_-]{9,}$/i.test(who)) return { accountId: who, label: who };
+  const users = await rest(acct, 'GET', `/rest/api/3/user/search?query=${encodeURIComponent(who)}`);
+  const u = users.find((x) => x.emailAddress === who) || users[0];
+  if (!u) throw new Error(`no user found for '${who}' on ${acct.site}.atlassian.net`);
+  return { accountId: u.accountId, label: u.displayName };
+}
+
+// Build a Jira `fields` object from a create spec (single or one bulk item).
+async function buildCreateFields(acct, spec, defaultProject) {
+  const project = spec.project || defaultProject;
+  if (!project) throw new Error("no project key: pass `project` or add '<folder>=<account>:<PROJECT>' to map.env");
+  const fields = {
+    project: { key: project },
+    summary: spec.summary,
+    issuetype: { name: spec.type || 'Task' },
+  };
+  if (spec.description != null) fields.description = typeof spec.description === 'object' ? spec.description : adf(spec.description);
+  if (spec.labels) fields.labels = spec.labels;
+  if (spec.priority) fields.priority = { name: spec.priority };
+  if (spec.parent) fields.parent = { key: spec.parent };
+  if (spec.duedate) fields.duedate = spec.duedate;
+  if (spec.components) fields.components = spec.components.map((c) => (typeof c === 'string' ? { name: c } : c));
+  if (spec.assignee) fields.assignee = { accountId: (await resolveAssignee(acct, spec.assignee)).accountId };
+  if (spec.fields) Object.assign(fields, spec.fields);
+  return { fields, project };
+}
+
+// POST /issue with the team-managed issue-type fallback (project may lack the
+// requested type; pick the closest available and label the issue instead).
+async function createWithFallback(acct, project, fields, wantType) {
+  try {
+    const out = await rest(acct, 'POST', '/rest/api/3/issue', { fields });
+    return { key: out.key };
+  } catch (e) {
+    if (!/valid issue type/i.test(e.message)) throw e;
+    const metaTypes = await rest(acct, 'GET', `/rest/api/3/issue/createmeta/${project}/issuetypes`);
+    const names = (metaTypes.issueTypes || metaTypes.values || []).map((t) => t.name);
+    const want = (wantType || 'Task').toLowerCase();
+    const pick = names.find((n) => n.toLowerCase() === want) || names.find((n) => n === 'Task') || names[0];
+    if (!pick) throw e;
+    fields.issuetype = { name: pick };
+    let note;
+    if (wantType && pick.toLowerCase() !== want) {
+      fields.labels = [...(fields.labels || []), wantType.toLowerCase()];
+      note = `type '${wantType}' unavailable in ${project} (has: ${names.join(', ')}); created as ${pick} with label '${wantType.toLowerCase()}'`;
+    }
+    const out = await rest(acct, 'POST', '/rest/api/3/issue', { fields });
+    return { key: out.key, note };
+  }
+}
+
 async function callTool(name, args = {}) {
   if (name === 'jira_accounts') {
     const accounts = loadAccounts();
@@ -284,11 +501,36 @@ async function callTool(name, args = {}) {
     }
     case 'jira_search': {
       const max = args.max || 20;
-      const data = await rest(acct, 'POST', '/rest/api/3/search/jql', {
-        jql: args.jql, maxResults: max,
-        fields: ['summary', 'status', 'issuetype', 'priority', 'assignee', 'updated'],
-      });
-      return { ...meta, total: data.total ?? data.issues?.length, issues: (data.issues || []).map(slimIssue) };
+      const fields = args.fields && args.fields.length ? args.fields : BASE_FIELDS;
+      // /rest/api/3/search/jql no longer returns a total, and maxResults is only
+      // an upper bound (a page may come back short while more matches exist), so
+      // page via nextPageToken until isLast or `max` collected. Never stop on
+      // "page shorter than requested".
+      const collected = [];
+      let token = args.cursor || args.nextPageToken || undefined;
+      let isLast = false;
+      const PAGE_CAP = 25; // hard safety on internal loop iterations
+      for (let page = 0; collected.length < max && page < PAGE_CAP; page++) {
+        const req = { jql: args.jql, maxResults: Math.min(max - collected.length, 100), fields };
+        if (token) req.nextPageToken = token;
+        const data = await rest(acct, 'POST', '/rest/api/3/search/jql', req);
+        collected.push(...(data.issues || []));
+        token = data.nextPageToken;
+        isLast = data.isLast ?? !token;
+        if (isLast || !token) break;
+      }
+      const out = {
+        ...meta,
+        returned: collected.length,
+        nextPageToken: token || null,
+        isLast,
+        issues: collected.map((i) => slimIssue(i, fields)),
+      };
+      if (args.count) {
+        const c = await rest(acct, 'POST', '/rest/api/3/search/approximate-count', { jql: args.jql });
+        out.approxCount = c.count;
+      }
+      return out;
     }
     case 'jira_issue': {
       const i = await rest(acct, 'GET', `/rest/api/3/issue/${encodeURIComponent(args.key)}?fields=summary,description,status,issuetype,priority,assignee,reporter,updated,created,labels,comment`);
@@ -299,40 +541,52 @@ async function callTool(name, args = {}) {
         assignee_id: i.fields?.assignee?.accountId || null,
         created: i.fields?.created,
         labels: i.fields?.labels,
-        description: i.fields?.description,
+        description: args.raw ? i.fields?.description : adfToMarkdown(i.fields?.description),
         comments: (i.fields?.comment?.comments || []).slice(-10).map((c) => ({
-          author: c.author?.displayName, created: c.created, body: c.body,
+          author: c.author?.displayName, created: c.created,
+          body: args.raw ? c.body : adfToMarkdown(c.body),
         })),
       };
     }
     case 'jira_create_issue': {
-      const project = args.project || acct.mapEntry?.project;
-      if (!project) throw new Error("no project key: pass `project` or add '<folder>=<account>:<PROJECT>' to map.env");
-      const fields = {
-        project: { key: project },
-        summary: args.summary,
-        issuetype: { name: args.type || 'Task' },
-      };
-      if (args.description) fields.description = adf(args.description);
-      let out, typeNote;
-      try {
-        out = await rest(acct, 'POST', '/rest/api/3/issue', { fields });
-      } catch (e) {
-        if (!/valid issue type/i.test(e.message)) throw e;
-        // project (e.g. team-managed kanban) lacks this type — pick closest available
-        const metaTypes = await rest(acct, 'GET', `/rest/api/3/issue/createmeta/${project}/issuetypes`);
-        const names = (metaTypes.issueTypes || metaTypes.values || []).map((t) => t.name);
-        const want = (args.type || 'Task').toLowerCase();
-        const pick = names.find((n) => n.toLowerCase() === want) || names.find((n) => n === 'Task') || names[0];
-        if (!pick) throw e;
-        fields.issuetype = { name: pick };
-        if (args.type && pick.toLowerCase() !== want) {
-          fields.labels = [...(fields.labels || []), args.type.toLowerCase()];
-          typeNote = `type '${args.type}' unavailable in ${project} (has: ${names.join(', ')}); created as ${pick} with label '${args.type.toLowerCase()}'`;
+      const { fields, project } = await buildCreateFields(acct, args, acct.mapEntry?.project);
+      const { key, note } = await createWithFallback(acct, project, fields, args.type);
+      return { ...meta, key, url: `https://${acct.site}.atlassian.net/browse/${key}`, ...(note ? { note } : {}) };
+    }
+    case 'jira_bulk_create': {
+      const specs = args.issues || [];
+      if (!specs.length) throw new Error('jira_bulk_create needs a non-empty `issues` array');
+      // Build each item's fields; collect build-time failures without aborting.
+      const built = [];
+      const errors = [];
+      for (let idx = 0; idx < specs.length; idx++) {
+        try {
+          const { fields } = await buildCreateFields(acct, specs[idx], acct.mapEntry?.project);
+          built.push({ idx, fields });
+        } catch (e) {
+          errors.push({ index: idx, summary: specs[idx]?.summary, error: e.message });
         }
-        out = await rest(acct, 'POST', '/rest/api/3/issue', { fields });
       }
-      return { ...meta, key: out.key, url: `https://${acct.site}.atlassian.net/browse/${out.key}`, ...(typeNote ? { note: typeNote } : {}) };
+      const created = [];
+      for (let i = 0; i < built.length; i += 50) {
+        const chunk = built.slice(i, i + 50);
+        const resp = await rest(acct, 'POST', '/rest/api/3/issue/bulk', {
+          issueUpdates: chunk.map((b) => ({ fields: b.fields })),
+        });
+        for (const c of resp.issues || []) {
+          created.push({ key: c.key, url: `https://${acct.site}.atlassian.net/browse/${c.key}` });
+        }
+        for (const err of resp.errors || []) {
+          const localIdx = chunk[err.failedElementNumber]?.idx;
+          const ee = err.elementErrors || {};
+          errors.push({
+            index: localIdx ?? err.failedElementNumber,
+            summary: localIdx != null ? specs[localIdx]?.summary : undefined,
+            error: (ee.errorMessages || []).join('; ') || JSON.stringify(ee.errors || {}) || 'unknown bulk error',
+          });
+        }
+      }
+      return { ...meta, created_count: created.length, error_count: errors.length, issues: created, errors };
     }
     case 'jira_update_issue': {
       await rest(acct, 'PUT', `/rest/api/3/issue/${encodeURIComponent(args.key)}`, { fields: args.fields });
@@ -348,24 +602,7 @@ async function callTool(name, args = {}) {
       return { ...meta, key: args.key, transitioned_to: t.to || t.name };
     }
     case 'jira_assign': {
-      const who = String(args.assignee).trim();
-      let accountId, label;
-      if (who.toLowerCase() === 'me') {
-        const me = await rest(acct, 'GET', '/rest/api/3/myself');
-        accountId = me.accountId; label = me.displayName;
-      } else if (who.toLowerCase() === 'reporter' || who.toLowerCase() === 'creator') {
-        const i = await rest(acct, 'GET', `/rest/api/3/issue/${encodeURIComponent(args.key)}?fields=reporter,creator`);
-        const r = i.fields?.reporter || i.fields?.creator;
-        if (!r?.accountId) throw new Error(`issue ${args.key} has no reporter/creator to assign back to`);
-        accountId = r.accountId; label = r.displayName;
-      } else if (!who.includes('@') && /^[0-9a-f][0-9a-f:_-]{9,}$/i.test(who)) {
-        accountId = who; label = who;
-      } else {
-        const users = await rest(acct, 'GET', `/rest/api/3/user/search?query=${encodeURIComponent(who)}`);
-        const u = users.find((x) => x.emailAddress === who) || users[0];
-        if (!u) throw new Error(`no user found for '${who}' on ${acct.site}.atlassian.net`);
-        accountId = u.accountId; label = u.displayName;
-      }
+      const { accountId, label } = await resolveAssignee(acct, args.assignee, args.key);
       await rest(acct, 'PUT', `/rest/api/3/issue/${encodeURIComponent(args.key)}/assignee`, { accountId });
       return { ...meta, key: args.key, assigned_to: label, accountId };
     }
@@ -405,7 +642,7 @@ rl.on('line', async (line) => {
       reply(id, {
         protocolVersion: params?.protocolVersion || '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'jira-multi', version: '1.0.0' },
+        serverInfo: { name: 'jira-multi', version: '1.1.0' },
       });
     } else if (method === 'notifications/initialized' || method === 'notifications/cancelled') {
       // no response to notifications
