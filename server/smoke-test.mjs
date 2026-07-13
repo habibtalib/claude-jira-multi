@@ -3,15 +3,21 @@
 //
 // Spawns the server, speaks JSON-RPC, and exercises READ-ONLY tools only:
 //   initialize -> tools/list -> jira_myself -> jira_search -> jira_issue
-// NO create/update/transition/bulk. Verifies:
-//   - tools/list advertises jira_bulk_create + the enriched schemas
+//   -> jira_my_queue -> jira_transition(list) -> jira_health(all accounts)
+//   -> confluence_search -> jira_link(list types) -> jira_sprints(board list)
+// NO writes: no create/update/transition-exec/bulk/link-create/worklog-add/
+// page-create-or-update/sprint-move. Verifies:
+//   - tools/list advertises the v1.3.0 tools + enriched schemas
 //   - jira_search returns pagination fields (nextPageToken/isLast/returned) and
 //     NO phantom `total`
 //   - jira_issue renders `description` as readable markdown, not raw ADF JSON
+//   - jira_health checks every account (catches expired tokens)
+//   - confluence_search / jira_link / jira_sprints new read paths work live
 //
 // Uses the real tokens in ~/Git/gsd-loop/config/atlassian.env against a live
-// account (default: ypj). Degrades gracefully with a clear message if the
-// config/network is unavailable.
+// account (default: ypj; Confluence check uses CONF_ACCOUNT/CONF_SPACE, default
+// iluvquran/QC). Degrades gracefully with a clear message if the config/network
+// is unavailable or a site lacks Confluence/boards.
 //
 // Usage: node server/smoke-test.mjs [account]
 
@@ -24,6 +30,8 @@ import { homedir } from 'node:os';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER = join(__dirname, 'jira-mcp.mjs');
 const ACCOUNT = process.argv[2] || 'ypj';
+const CONF_ACCOUNT = process.env.CONF_ACCOUNT || 'iluvquran';
+const CONF_SPACE = process.env.CONF_SPACE || 'QC';
 const ENV_FILE = process.env.ATLASSIAN_ENV || join(homedir(), 'Git', 'gsd-loop', 'config', 'atlassian.env');
 const MAP_FILE = process.env.JIRA_MAP || join(homedir(), 'Git', 'gsd-loop', 'config', 'jira-map.env');
 
@@ -86,10 +94,14 @@ function looksLikeRawADF(v) {
     const init = await rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'smoke', version: '0' } });
     ok('initialize', !!init.result?.serverInfo, `server ${init.result?.serverInfo?.name} v${init.result?.serverInfo?.version}`);
 
+    ok('serverInfo is v1.3.0', init.result?.serverInfo?.version === '1.3.0', `v${init.result?.serverInfo?.version}`);
+
     const list = await rpc('tools/list', {});
     const tools = list.result?.tools || [];
     const names = tools.map((t) => t.name);
     ok('tools/list has jira_bulk_create', names.includes('jira_bulk_create'), `${tools.length} tools`);
+    const v13 = ['jira_health', 'confluence_search', 'confluence_page', 'confluence_create_page', 'confluence_update_page', 'jira_link', 'jira_worklog', 'jira_sprints'];
+    ok('tools/list has all v1.3.0 tools', v13.every((n) => names.includes(n)), `missing: ${v13.filter((n) => !names.includes(n)).join(',') || 'none'}`);
     const createSchema = tools.find((t) => t.name === 'jira_create_issue')?.inputSchema?.properties || {};
     ok('jira_create_issue enriched schema', ['labels', 'priority', 'assignee', 'parent', 'duedate'].every((k) => k in createSchema),
       `props: ${Object.keys(createSchema).join(',')}`);
@@ -156,6 +168,58 @@ function looksLikeRawADF(v) {
           `${firstKey}: ${ts.length} transitions, categories: ${[...new Set(ts.map((t) => t.to_category))].join(',') || '(none available)'}`);
       }
     }
+    // ---- jira_health across ALL accounts (read-only /myself sweep) ----
+    const health = await callTool('jira_health', {});
+    if (health.isError) { ok('jira_health (live)', false, health.text.slice(0, 200)); }
+    else {
+      const h = health.parsed;
+      const shape = Array.isArray(h.accounts) && typeof h.ok_count === 'number' && typeof h.failed_count === 'number';
+      ok('jira_health checks every account', shape && h.checked >= 1,
+        `${h.ok_count}/${h.checked} ok, ${h.failed_count} failed` + (h.failed_count ? ` [${h.accounts.filter((a) => !a.ok).map((a) => a.account).join(',')}]` : ''));
+      ok('jira_health entries have ok/displayName/tokenHint', h.accounts.every((a) => 'ok' in a && (a.ok ? a.displayName : a.error)),
+        h.accounts.map((a) => `${a.account}:${a.ok ? 'ok' : 'FAIL'}`).join(' '));
+    }
+
+    // ---- confluence_search on a real space (read-only CQL) ----
+    const conf = await callTool('confluence_search', { account: CONF_ACCOUNT, space: CONF_SPACE, text: '', limit: 5 });
+    if (conf.isError) {
+      ok('confluence_search (live)', false, `${CONF_ACCOUNT}/${CONF_SPACE}: ${conf.text.slice(0, 160)}`);
+    } else {
+      const c = conf.parsed;
+      ok('confluence_search returns results[] + cql', Array.isArray(c.results) && typeof c.cql === 'string',
+        `${CONF_ACCOUNT}/${CONF_SPACE}: size=${c.size} cql='${c.cql}' first='${(c.results[0]?.title || '').slice(0, 40)}'`);
+      // Bonus read-only: fetch the first page's ADF body -> markdown.
+      const pid = c.results?.find((r) => r.type === 'page' && r.id)?.id;
+      if (pid) {
+        const pg = await callTool('confluence_page', { account: CONF_ACCOUNT, id: String(pid) });
+        ok('confluence_page renders body markdown', !pg.isError && (pg.parsed.body == null || typeof pg.parsed.body === 'string'),
+          pg.isError ? pg.text.slice(0, 120) : `page ${pid} "${(pg.parsed.title || '').slice(0, 40)}" v${pg.parsed.version}`);
+      }
+    }
+
+    // ---- jira_link LIST types (read-only) ----
+    const links = await callTool('jira_link', { account: ACCOUNT });
+    if (links.isError) { ok('jira_link list types (live)', false, links.text.slice(0, 200)); }
+    else {
+      const lt = links.parsed.link_types || [];
+      ok('jira_link lists link types', Array.isArray(lt) && lt.length > 0 && lt.every((t) => t.name),
+        `${lt.length} types: ${lt.map((t) => t.name).slice(0, 6).join(', ')}`);
+    }
+
+    // ---- jira_sprints board list (read-only) ----
+    const proj = firstKey ? firstKey.split('-')[0] : null;
+    if (proj) {
+      const sp = await callTool('jira_sprints', { account: ACCOUNT, project: proj });
+      if (sp.isError) { ok('jira_sprints board list (live)', false, sp.text.slice(0, 200)); }
+      else {
+        const s = sp.parsed;
+        const shape = Array.isArray(s.boards);
+        const nSprints = (s.boards || []).reduce((n, b) => n + (b.sprints?.length || 0), 0);
+        ok('jira_sprints lists boards (graceful if none)', shape,
+          `${proj}: ${s.boards.length} board(s), ${nSprints} active/future sprint(s)${s.note ? ` — ${s.note}` : ''}`);
+      }
+    }
+
   } catch (e) {
     if (!['live-auth-failed', 'search-failed'].includes(e.message)) ok('unexpected error', false, e.message);
   } finally {

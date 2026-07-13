@@ -419,6 +419,114 @@ const TOOLS = [
       required: ['method', 'path'],
     },
   },
+  {
+    name: 'jira_health',
+    description: 'Verify credentials for ALL configured accounts (or a passed subset) in one call — GET /myself per account. Returns per-account {ok, displayName, email, error, tokenHint}. Catches expired/revoked API tokens early (they hard-expire ≤1yr). Read-only.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        accounts: { type: 'array', items: { type: 'string' }, description: 'Account names to check; omit to check every configured account.' },
+      },
+    },
+  },
+  {
+    name: 'confluence_search',
+    description: 'Search Confluence with CQL (v1 /wiki/rest/api/search — CQL stays v1). Pass raw `cql`, or `text` (+ optional `space` key, auto-scoped from map.env) to build `text ~ "..."`. Read-only.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        cql: { type: 'string', description: 'Raw CQL, e.g. \'type=page AND space=QC AND text ~ "roadmap"\'. Takes precedence over text/space.' },
+        text: { type: 'string', description: 'Free-text query (builds `text ~ "..."`).' },
+        space: { type: 'string', description: 'Confluence space KEY to scope to; omit to use the folder-mapped space from map.env.' },
+        limit: { type: 'number', description: 'Max results (default 20).' },
+        account: { type: 'string' },
+      },
+    },
+  },
+  {
+    name: 'confluence_page',
+    description: 'Get one Confluence page by id (v2 /wiki/api/v2/pages/{id}?body-format=atlas_doc_format). The ADF body is rendered to readable markdown by default (pass raw:true for the raw ADF JSON). Read-only.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Page id (numeric string).' },
+        raw: { type: 'boolean', description: 'Return the raw ADF body instead of markdown.' },
+        account: { type: 'string' },
+      },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'confluence_create_page',
+    description: 'Create a Confluence page (v2 /wiki/api/v2/pages). Resolves numeric spaceId from a space KEY. Body is markdown wrapped as ADF (atlas_doc_format; the ADF value is JSON-encoded per the v2 contract).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string' },
+        body: { type: 'string', description: 'Page body (markdown/plain text, wrapped in ADF).' },
+        space: { type: 'string', description: 'Space KEY; omit to use the folder-mapped space from map.env.' },
+        spaceId: { type: 'string', description: 'Numeric spaceId (skips KEY resolution if you already have it).' },
+        parentId: { type: 'string', description: 'Parent page id (optional).' },
+        account: { type: 'string' },
+      },
+      required: ['title'],
+    },
+  },
+  {
+    name: 'confluence_update_page',
+    description: 'Update a Confluence page (v2 PUT /wiki/api/v2/pages/{id}). Fetches the current version and increments version.number. Title defaults to the existing title if omitted.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Page id.' },
+        body: { type: 'string', description: 'New page body (markdown/plain text, wrapped in ADF).' },
+        title: { type: 'string', description: 'New title; omit to keep the current one.' },
+        account: { type: 'string' },
+      },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'jira_link',
+    description: 'Create an issue link, or list available link types when called with no inward/outward/type. type matched case-insensitively against link-type names AND inward/outward phrasings (Blocks / Relates / Duplicate / "is blocked by" …).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        inward: { type: 'string', description: 'Inward issue key (the one that "is blocked by" / "relates to" the outward issue).' },
+        outward: { type: 'string', description: 'Outward issue key (the one that "blocks" / "duplicates" the inward issue).' },
+        type: { type: 'string', description: 'Link type, e.g. Blocks, Relates, Duplicate. Omit (with no keys) to list all link types.' },
+        account: { type: 'string' },
+      },
+    },
+  },
+  {
+    name: 'jira_worklog',
+    description: 'Add a worklog to an issue (timeSpent like "1h 30m", optional comment, optional started), or list recent worklogs when timeSpent is omitted.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        key: { type: 'string', description: 'Issue key.' },
+        timeSpent: { type: 'string', description: 'Time spent, Jira format e.g. "1h 30m", "45m", "2d". Omit to list recent worklogs.' },
+        comment: { type: 'string', description: 'Worklog comment (wrapped in ADF).' },
+        started: { type: 'string', description: 'Start time ISO-ish (e.g. 2026-07-13T10:00:00.000+0000); defaults to now.' },
+        account: { type: 'string' },
+      },
+      required: ['key'],
+    },
+  },
+  {
+    name: 'jira_sprints',
+    description: 'List boards + their active/future sprints for a project, or move issues into a sprint. {project} lists boards & sprints; {sprint, issues:[keys]} moves ≤50 issues to a sprint (sprint = numeric id, or a name resolved against the project\'s sprints). Projects with no board are handled gracefully.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string', description: 'Project key (to list boards/sprints, or to resolve a sprint by name). Omit to use folder-mapped project.' },
+        sprint: { type: 'string', description: 'Sprint id (numeric) or name to move issues into.' },
+        issues: { type: 'array', items: { type: 'string' }, description: 'Issue keys to move into `sprint` (≤50 per call, chunked).' },
+        account: { type: 'string' },
+      },
+    },
+  },
 ];
 
 const adf = (text) => ({
@@ -535,7 +643,79 @@ function buildQueueJql({ project, types, excludeLabels } = {}) {
   return parts.join(' AND ') + ' ORDER BY priority DESC, created ASC';
 }
 
+// Resolve a Confluence space KEY -> numeric spaceId (v2 needs the id, not the
+// key). Cached per account+key for the process lifetime.
+const _spaceIdCache = new Map();
+async function resolveSpaceId(acct, spaceKey) {
+  const ck = `${acct.name}:${spaceKey}`;
+  if (_spaceIdCache.has(ck)) return _spaceIdCache.get(ck);
+  const data = await rest(acct, 'GET', `/wiki/api/v2/spaces?keys=${encodeURIComponent(spaceKey)}`);
+  const id = data.results?.[0]?.id;
+  if (!id) throw new Error(`no Confluence space with key '${spaceKey}' on ${acct.site}.atlassian.net`);
+  _spaceIdCache.set(ck, id);
+  return id;
+}
+
+// Confluence v2 wants the ADF body as a JSON-encoded STRING, not an object.
+const confBody = (markdown) => ({ representation: 'atlas_doc_format', value: JSON.stringify(adf(markdown ?? '')) });
+
+// Jira worklog `started` must be ...T..±HHMM (it rejects the trailing 'Z').
+function worklogStarted(started) {
+  if (started) return started;
+  return new Date().toISOString().replace('Z', '+0000');
+}
+
+// Flatten active/future sprints across all of a project's boards (for name->id
+// resolution when moving issues into a sprint).
+async function listSprints(acct, project) {
+  const boardsData = await rest(acct, 'GET', `/rest/agile/1.0/board?projectKeyOrId=${encodeURIComponent(project)}`);
+  const sprints = [];
+  const seen = new Set();
+  for (const b of boardsData.values || []) {
+    try {
+      const sd = await rest(acct, 'GET', `/rest/agile/1.0/board/${b.id}/sprint?state=active,future`);
+      for (const s of sd.values || []) {
+        if (seen.has(s.id)) continue;
+        seen.add(s.id);
+        sprints.push({ id: s.id, name: s.name, state: s.state });
+      }
+    } catch { /* board type without sprints (kanban) — skip */ }
+  }
+  return sprints;
+}
+
 async function callTool(name, args = {}) {
+  if (name === 'jira_health') {
+    const accounts = loadAccounts();
+    const names = (args.accounts && args.accounts.length)
+      ? args.accounts.map((n) => String(n).toLowerCase())
+      : Object.keys(accounts);
+    const report = [];
+    for (const nm of names) {
+      const tokenHint = accounts[nm]?.token ? '…' + accounts[nm].token.slice(-4) : null;
+      try {
+        const a = getAccount(nm);
+        const t0 = Date.now();
+        const me = await rest(a, 'GET', '/rest/api/3/myself');
+        report.push({
+          account: nm, site: `${a.site}.atlassian.net`, ok: true,
+          displayName: me.displayName, email: me.emailAddress,
+          latencyMs: Date.now() - t0, tokenHint: '…' + a.token.slice(-4),
+        });
+      } catch (e) {
+        const expired = /HTTP 401/.test(e.message);
+        report.push({
+          account: nm, ok: false, error: e.message, tokenHint,
+          hint: expired
+            ? `token likely expired/revoked — recreate at https://id.atlassian.com/manage-profile/security/api-tokens and update ${ENV_FILE}`
+            : 'check account config / network',
+        });
+      }
+    }
+    const failed = report.filter((r) => !r.ok);
+    return { checked: report.length, ok_count: report.length - failed.length, failed_count: failed.length, accounts: report };
+  }
+
   if (name === 'jira_accounts') {
     const accounts = loadAccounts();
     const r = resolveAccount(null, accounts);
@@ -694,6 +874,157 @@ async function callTool(name, args = {}) {
       const out = await rest(acct, args.method.toUpperCase(), args.path, args.body);
       return { ...meta, result: out };
     }
+    case 'confluence_search': {
+      let cql = args.cql;
+      if (!cql) {
+        const parts = [];
+        const space = args.space || acct.mapEntry?.space;
+        if (space) parts.push(`space = "${String(space).replace(/"/g, '')}"`);
+        if (args.text) parts.push(`text ~ "${String(args.text).replace(/"/g, '\\"')}"`);
+        if (!parts.length) throw new Error('confluence_search needs `cql`, or `text` (optionally with `space`).');
+        cql = parts.join(' AND ');
+      }
+      const limit = args.limit || 20;
+      const data = await rest(acct, 'GET', `/wiki/rest/api/search?cql=${encodeURIComponent(cql)}&limit=${limit}`);
+      const results = (data.results || []).map((r) => {
+        const c = r.content || {};
+        return {
+          id: c.id || r.id, type: c.type || r.entityType, title: c.title || r.title,
+          space: c.space?.key || r.resultGlobalContainer?.title,
+          url: r._links?.webui || r.url ? `https://${acct.site}.atlassian.net/wiki${r.url || c._links?.webui || ''}` : undefined,
+          excerpt: r.excerpt || undefined,
+        };
+      });
+      return { ...meta, cql, size: data.size ?? results.length, results };
+    }
+    case 'confluence_page': {
+      const page = await rest(acct, 'GET', `/wiki/api/v2/pages/${encodeURIComponent(args.id)}?body-format=atlas_doc_format`);
+      let body = page.body?.atlas_doc_format?.value ?? null;
+      if (!args.raw && body != null) {
+        let adfDoc; try { adfDoc = JSON.parse(body); } catch { adfDoc = body; }
+        body = adfToMarkdown(adfDoc);
+      } else if (args.raw && body != null) {
+        try { body = JSON.parse(body); } catch { /* leave as string */ }
+      }
+      return {
+        ...meta, id: page.id, title: page.title, status: page.status,
+        spaceId: page.spaceId, parentId: page.parentId,
+        version: page.version?.number,
+        url: page._links?.webui ? `https://${acct.site}.atlassian.net/wiki${page._links.webui}` : undefined,
+        body,
+      };
+    }
+    case 'confluence_create_page': {
+      let spaceId = args.spaceId;
+      if (!spaceId) {
+        const key = args.space || acct.mapEntry?.space;
+        if (!key) throw new Error("no Confluence space: pass `space` (key) or `spaceId`, or add a space to map.env (<folder>=<account>:<PROJECT>:<SPACE>).");
+        spaceId = await resolveSpaceId(acct, key);
+      }
+      const payload = { spaceId: String(spaceId), status: 'current', title: args.title, body: confBody(args.body) };
+      if (args.parentId) payload.parentId = String(args.parentId);
+      const out = await rest(acct, 'POST', '/wiki/api/v2/pages', payload);
+      return {
+        ...meta, id: out.id, title: out.title, spaceId: out.spaceId, version: out.version?.number,
+        url: out._links?.webui ? `https://${acct.site}.atlassian.net/wiki${out._links.webui}` : undefined,
+      };
+    }
+    case 'confluence_update_page': {
+      const current = await rest(acct, 'GET', `/wiki/api/v2/pages/${encodeURIComponent(args.id)}`);
+      const nextVersion = (current.version?.number || 1) + 1;
+      const payload = {
+        id: String(args.id), status: 'current',
+        title: args.title || current.title,
+        body: confBody(args.body),
+        version: { number: nextVersion },
+      };
+      const out = await rest(acct, 'PUT', `/wiki/api/v2/pages/${encodeURIComponent(args.id)}`, payload);
+      return {
+        ...meta, id: out.id, title: out.title, version: out.version?.number,
+        url: out._links?.webui ? `https://${acct.site}.atlassian.net/wiki${out._links.webui}` : undefined,
+      };
+    }
+    case 'jira_link': {
+      const types = await rest(acct, 'GET', '/rest/api/3/issueLinkType');
+      const list = (types.issueLinkTypes || []).map((t) => ({ id: t.id, name: t.name, inward: t.inward, outward: t.outward }));
+      if (!args.type && !args.inward && !args.outward) {
+        return { ...meta, link_types: list };
+      }
+      if (!args.type || !args.inward || !args.outward) {
+        throw new Error('jira_link needs `type`, `inward` and `outward` to create a link (or no args to list link types).');
+      }
+      const want = String(args.type).toLowerCase();
+      const match = list.find((t) => t.name.toLowerCase() === want)
+        || list.find((t) => (t.inward || '').toLowerCase() === want || (t.outward || '').toLowerCase() === want)
+        || list.find((t) => t.name.toLowerCase().includes(want));
+      if (!match) throw new Error(`no link type matching '${args.type}'; available: ${list.map((t) => t.name).join(', ')}`);
+      await rest(acct, 'POST', '/rest/api/3/issueLink', {
+        type: { name: match.name },
+        inwardIssue: { key: args.inward },
+        outwardIssue: { key: args.outward },
+      });
+      return { ...meta, linked: true, type: match.name, inward: args.inward, outward: args.outward, meaning: `${args.outward} ${match.outward} ${args.inward}` };
+    }
+    case 'jira_worklog': {
+      if (!args.timeSpent) {
+        const wl = await rest(acct, 'GET', `/rest/api/3/issue/${encodeURIComponent(args.key)}/worklog`);
+        const worklogs = (wl.worklogs || []).slice(-20).map((w) => ({
+          id: w.id, author: w.author?.displayName, timeSpent: w.timeSpent,
+          timeSpentSeconds: w.timeSpentSeconds, started: w.started,
+          comment: w.comment ? adfToMarkdown(w.comment) : null,
+        }));
+        return { ...meta, key: args.key, total: wl.total ?? worklogs.length, worklogs };
+      }
+      const body = { timeSpent: args.timeSpent, started: worklogStarted(args.started) };
+      if (args.comment) body.comment = adf(args.comment);
+      const out = await rest(acct, 'POST', `/rest/api/3/issue/${encodeURIComponent(args.key)}/worklog`, body);
+      return { ...meta, key: args.key, worklog_id: out.id, timeSpent: out.timeSpent, started: out.started };
+    }
+    case 'jira_sprints': {
+      // Move mode: {sprint, issues} -> add issues to a sprint (≤50/request).
+      if (args.sprint && args.issues && args.issues.length) {
+        let sprintId = /^\d+$/.test(String(args.sprint)) ? String(args.sprint) : null;
+        if (!sprintId) {
+          const project = args.project || acct.mapEntry?.project;
+          if (!project) throw new Error('resolving a sprint by name needs `project` (or a folder-mapped project).');
+          const sprints = await listSprints(acct, project);
+          const s = sprints.find((x) => x.name?.toLowerCase() === String(args.sprint).toLowerCase())
+            || sprints.find((x) => x.name?.toLowerCase().includes(String(args.sprint).toLowerCase()));
+          if (!s) throw new Error(`no active/future sprint matching '${args.sprint}' in ${project}; available: ${sprints.map((x) => x.name).join(', ') || '(none)'}`);
+          sprintId = String(s.id);
+        }
+        const keys = args.issues;
+        for (let i = 0; i < keys.length; i += 50) {
+          await rest(acct, 'POST', `/rest/agile/1.0/sprint/${sprintId}/issue`, { issues: keys.slice(i, i + 50) });
+        }
+        return { ...meta, sprint: sprintId, moved_count: keys.length, issues: keys };
+      }
+      // List mode: {project} -> boards + their active/future sprints.
+      const project = args.project || acct.mapEntry?.project;
+      if (!project) throw new Error("jira_sprints needs `project` (or a folder-mapped project) to list boards/sprints.");
+      let boardsData;
+      try {
+        boardsData = await rest(acct, 'GET', `/rest/agile/1.0/board?projectKeyOrId=${encodeURIComponent(project)}`);
+      } catch (e) {
+        if (/HTTP 404/.test(e.message)) return { ...meta, project, boards: [], note: 'Jira Software / Agile API not available on this site (404).' };
+        throw e;
+      }
+      const boards = boardsData.values || [];
+      if (!boards.length) return { ...meta, project, boards: [], note: `no boards found for project ${project}.` };
+      const out = [];
+      for (const b of boards) {
+        let sprints = [];
+        let note;
+        try {
+          const sd = await rest(acct, 'GET', `/rest/agile/1.0/board/${b.id}/sprint?state=active,future`);
+          sprints = (sd.values || []).map((s) => ({ id: s.id, name: s.name, state: s.state, startDate: s.startDate, endDate: s.endDate }));
+        } catch (e) {
+          note = /HTTP 400/.test(e.message) ? 'board type has no sprints (e.g. kanban)' : e.message;
+        }
+        out.push({ id: b.id, name: b.name, type: b.type, sprints, ...(note ? { note } : {}) });
+      }
+      return { ...meta, project, boards: out };
+    }
     default:
       throw new Error(`unknown tool: ${name}`);
   }
@@ -721,7 +1052,7 @@ rl.on('line', async (line) => {
       reply(id, {
         protocolVersion: params?.protocolVersion || '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'jira-multi', version: '1.2.0' },
+        serverInfo: { name: 'jira-multi', version: '1.3.0' },
       });
     } else if (method === 'notifications/initialized' || method === 'notifications/cancelled') {
       // no response to notifications
