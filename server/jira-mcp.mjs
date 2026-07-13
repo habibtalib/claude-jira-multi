@@ -29,7 +29,11 @@ function parseEnvFile(path) {
   if (!existsSync(path)) return out;
   for (const line of readFileSync(path, 'utf8').split('\n')) {
     const m = line.match(/^\s*([A-Za-z0-9_.-]+)\s*=\s*(.*?)\s*$/);
-    if (m && !line.trim().startsWith('#')) out[m[1]] = m[2].replace(/^["']|["']$/g, '');
+    if (m && !line.trim().startsWith('#')) {
+      let v = m[2];
+      if (!/^["']/.test(v)) v = v.replace(/\s+#.*$/, ''); // strip inline comment on unquoted values
+      out[m[1]] = v.replace(/^["']|["']$/g, '').trim();
+    }
   }
   return out;
 }
