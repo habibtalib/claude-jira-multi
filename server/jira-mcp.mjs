@@ -46,7 +46,8 @@ function loadAccounts() {
     if (!m) continue;
     const name = m[1].toLowerCase();
     accounts[name] = {
-      site: env[`${m[1]}_SITE`],
+      // normalize: accept 'foo', 'foo.atlassian.net', or 'https://foo.atlassian.net'
+      site: (env[`${m[1]}_SITE`] || '').trim().replace(/^https?:\/\//i, '').replace(/\.atlassian\.net.*$/i, ''),
       email: env[`${m[1]}_EMAIL`] || '',
       token: env[`${m[1]}_TOKEN`] || '',
     };
