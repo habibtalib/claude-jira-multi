@@ -672,6 +672,19 @@ const TOOLS = [
       },
     },
   },
+  {
+    name: 'jira_attachments',
+    description: "List an issue's attachments (omit filePath), or upload a new file attachment (pass filePath). List returns filename/size/mimeType/created/content URL per attachment. Upload posts multipart/form-data with X-Atlassian-Token: no-check.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        key: { type: 'string', description: 'Issue key, e.g. ABC-123.' },
+        filePath: { type: 'string', description: 'Absolute path to a local file to upload. Omit to list existing attachments.' },
+        account: { type: 'string', description: 'Account name; omit to auto-resolve from folder.' },
+      },
+      required: ['key'],
+    },
+  },
 ];
 
 // Thin wrapper kept for existing call sites: markdown (or plain text) -> ADF doc.
@@ -1171,6 +1184,42 @@ async function callTool(name, args = {}) {
       }
       return { ...meta, project, boards: out };
     }
+    case 'jira_attachments': {
+      const key = args.key;
+      if (!args.filePath) {
+        // LIST mode: GET issue with attachment field
+        const data = await rest(acct, 'GET', `/rest/api/3/issue/${encodeURIComponent(key)}?fields=attachment`);
+        const attachments = (data.fields?.attachment || []).map((a) => ({
+          id: a.id, filename: a.filename, size: a.size,
+          mimeType: a.mimeType, created: a.created, content: a.content,
+        }));
+        return { ...meta, key, count: attachments.length, attachments };
+      }
+      // UPLOAD mode: POST multipart/form-data (rest() is JSON-only, so call fetch directly)
+      const fileContent = readFileSync(args.filePath);
+      const filename = basename(args.filePath);
+      const form = new FormData();
+      form.append('file', new Blob([fileContent]), filename);
+      const url = `https://${acct.site}.atlassian.net/rest/api/3/issue/${encodeURIComponent(key)}/attachments`;
+      const headers = {
+        Authorization: 'Basic ' + Buffer.from(`${acct.email}:${acct.token}`).toString('base64'),
+        'X-Atlassian-Token': 'no-check',
+      };
+      const res = await fetch(url, { method: 'POST', headers, body: form });
+      const text = await res.text();
+      let uploadData;
+      try { uploadData = text ? JSON.parse(text) : {}; } catch { uploadData = { raw: text.slice(0, 2000) }; }
+      if (!res.ok) {
+        const msg = uploadData?.errorMessages?.join('; ') || uploadData?.message || text.slice(0, 500) || res.statusText;
+        throw new Error(`POST ${url} → HTTP ${res.status}: ${msg}`);
+      }
+      const att = Array.isArray(uploadData) ? uploadData[0] : uploadData;
+      return {
+        ...meta, key, uploaded: true,
+        id: att.id, filename: att.filename, size: att.size,
+        mimeType: att.mimeType, created: att.created, content: att.content,
+      };
+    }
     default:
       throw new Error(`unknown tool: ${name}`);
   }
@@ -1208,7 +1257,7 @@ rl.on('line', async (line) => {
       reply(id, {
         protocolVersion: params?.protocolVersion || '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'jira-multi', version: '1.4.0' },
+        serverInfo: { name: 'jira-multi', version: '1.5.0' },
       });
     } else if (method === 'notifications/initialized' || method === 'notifications/cancelled') {
       // no response to notifications

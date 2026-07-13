@@ -94,7 +94,7 @@ function looksLikeRawADF(v) {
     const init = await rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'smoke', version: '0' } });
     ok('initialize', !!init.result?.serverInfo, `server ${init.result?.serverInfo?.name} v${init.result?.serverInfo?.version}`);
 
-    ok('serverInfo is v1.4.0', init.result?.serverInfo?.version === '1.4.0', `v${init.result?.serverInfo?.version}`);
+    ok('serverInfo is v1.5.0', init.result?.serverInfo?.version === '1.5.0', `v${init.result?.serverInfo?.version}`);
 
     const list = await rpc('tools/list', {});
     const tools = list.result?.tools || [];
@@ -102,6 +102,7 @@ function looksLikeRawADF(v) {
     ok('tools/list has jira_bulk_create', names.includes('jira_bulk_create'), `${tools.length} tools`);
     const v13 = ['jira_health', 'confluence_search', 'confluence_page', 'confluence_create_page', 'confluence_update_page', 'jira_link', 'jira_worklog', 'jira_sprints'];
     ok('tools/list has all v1.3.0 tools', v13.every((n) => names.includes(n)), `missing: ${v13.filter((n) => !names.includes(n)).join(',') || 'none'}`);
+    ok('tools/list has jira_attachments (v1.5.0)', names.includes('jira_attachments'), `${tools.length} tools`);
     const createSchema = tools.find((t) => t.name === 'jira_create_issue')?.inputSchema?.properties || {};
     ok('jira_create_issue enriched schema', ['labels', 'priority', 'assignee', 'parent', 'duedate'].every((k) => k in createSchema),
       `props: ${Object.keys(createSchema).join(',')}`);
@@ -217,6 +218,17 @@ function looksLikeRawADF(v) {
         const nSprints = (s.boards || []).reduce((n, b) => n + (b.sprints?.length || 0), 0);
         ok('jira_sprints lists boards (graceful if none)', shape,
           `${proj}: ${s.boards.length} board(s), ${nSprints} active/future sprint(s)${s.note ? ` — ${s.note}` : ''}`);
+      }
+    }
+
+    // ---- jira_attachments LIST (read-only) ----
+    if (firstKey) {
+      const atts = await callTool('jira_attachments', { account: ACCOUNT, key: firstKey });
+      if (atts.isError) { ok('jira_attachments list (live)', false, atts.text.slice(0, 200)); }
+      else {
+        const a = atts.parsed;
+        ok('jira_attachments list returns attachments[]', Array.isArray(a.attachments) && typeof a.count === 'number',
+          `${firstKey}: ${a.count} attachment(s)`);
       }
     }
 
